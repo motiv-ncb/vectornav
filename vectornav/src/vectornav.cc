@@ -131,13 +131,31 @@ Vectornav::Vectornav(const rclcpp::NodeOptions & options) : Node("vectornav", op
   declare_parameter<int>("BO3.insField", vn::protocol::uart::InsGroup::INSGROUP_NONE);
   declare_parameter<int>("BO3.gps2Field", vn::protocol::uart::GpsGroup::GPSGROUP_NONE);
 
+  // IMU Filtering Configuration (7.2.5), only written when imuFiltering.write is true.
+  // Defaults are the VN-100 factory values. Written to RAM, not saved to flash.
+  declare_parameter<bool>("imuFiltering.write", false);
+  declare_parameter<int>("imuFiltering.magWindowSize", 0);
+  declare_parameter<int>("imuFiltering.accelWindowSize", 4);
+  declare_parameter<int>("imuFiltering.gyroWindowSize", 4);
+  declare_parameter<int>("imuFiltering.tempWindowSize", 4);
+  declare_parameter<int>("imuFiltering.presWindowSize", 0);
+  declare_parameter<int>(
+    "imuFiltering.magFilterMode", vn::protocol::uart::FilterMode::FILTERMODE_NOFILTERING);
+  declare_parameter<int>(
+    "imuFiltering.accelFilterMode", vn::protocol::uart::FilterMode::FILTERMODE_BOTH);
+  declare_parameter<int>(
+    "imuFiltering.gyroFilterMode", vn::protocol::uart::FilterMode::FILTERMODE_BOTH);
+  declare_parameter<int>(
+    "imuFiltering.tempFilterMode", vn::protocol::uart::FilterMode::FILTERMODE_BOTH);
+  declare_parameter<int>(
+    "imuFiltering.presFilterMode", vn::protocol::uart::FilterMode::FILTERMODE_NOFILTERING);
+
   /// TODO(Dereck): Static Settings, read before write to protect flash memory?
   /// User Tag
   /// Magnetometer Compensation (7.2.1)
   /// Acceleration Compensation (7.2.2)
   /// Gyro Compensation (7.2.3)
   /// Reference Frame Rotation (7.2.4)
-  /// IMU Filtering (7.2.5)
   /// Delta Theta Velocity Configuration (7.2.6)
   ///
   /// GPS Configuration (8.2.1)
@@ -609,6 +627,23 @@ bool Vectornav::configure_sensor()
     static_cast<uint16_t>(get_parameter("syncOutSkipFactor").as_int()),
     static_cast<uint32_t>(get_parameter("syncOutPulseWidth_ns").as_int())};
   vs_->writeSynchronizationControl(configSync);
+
+  // IMU Filtering Configuration
+  // 7.2.5
+  if (get_parameter("imuFiltering.write").as_bool()) {
+    vn::sensors::ImuFilteringConfigurationRegister configImuFiltering = {
+      static_cast<uint16_t>(get_parameter("imuFiltering.magWindowSize").as_int()),
+      static_cast<uint16_t>(get_parameter("imuFiltering.accelWindowSize").as_int()),
+      static_cast<uint16_t>(get_parameter("imuFiltering.gyroWindowSize").as_int()),
+      static_cast<uint16_t>(get_parameter("imuFiltering.tempWindowSize").as_int()),
+      static_cast<uint16_t>(get_parameter("imuFiltering.presWindowSize").as_int()),
+      (vn::protocol::uart::FilterMode)get_parameter("imuFiltering.magFilterMode").as_int(),
+      (vn::protocol::uart::FilterMode)get_parameter("imuFiltering.accelFilterMode").as_int(),
+      (vn::protocol::uart::FilterMode)get_parameter("imuFiltering.gyroFilterMode").as_int(),
+      (vn::protocol::uart::FilterMode)get_parameter("imuFiltering.tempFilterMode").as_int(),
+      (vn::protocol::uart::FilterMode)get_parameter("imuFiltering.presFilterMode").as_int()};
+    vs_->writeImuFilteringConfiguration(configImuFiltering);
+  }
 
   // Communication Protocol Control
   // 5.2.10
