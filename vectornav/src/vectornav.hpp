@@ -12,7 +12,9 @@
 
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <vector>
 
 // ROS2
 #include <rclcpp/rclcpp.hpp>
@@ -48,6 +50,7 @@ namespace vectornav {
     bool configure_sensor();
     bool connect(const std::string port, const int baud);
     rclcpp::Time getTimeStamp(vn::sensors::CompositeData & data);
+    bool isConfiguredLayout(vn::protocol::uart::Packet & packet);
     static void ErrorPacketReceivedHandler(
       void * nodeptr, vn::protocol::uart::Packet & errorPacket, size_t packetStartRunningIndex);
     static void AsyncPacketReceivedHandler(
@@ -140,6 +143,16 @@ namespace vectornav {
     /// ROS header time stamp adjustments
     double averageTimeDifference_{0};
     bool adjustROSTimeStamp_{false};
+    /// Binary packet layouts (groups byte + group fields) the sensor was configured to send
+    struct BinaryLayout
+    {
+      uint8_t groups;
+      std::vector<uint16_t> fields;
+    };
+    std::vector<BinaryLayout> binaryLayouts_;
+    std::mutex binaryLayoutsMutex_;
+    size_t droppedPackets_{0};
+    size_t consecutiveDropped_{0};
   
     // Subscriptions
     rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr sub_vel_aiding_;

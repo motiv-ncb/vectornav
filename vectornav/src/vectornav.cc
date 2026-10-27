@@ -689,6 +689,48 @@ bool Vectornav::configure_sensor()
   // 5.2.13
   vs_->writeBinaryOutput3(boConfigs.at(2));
 
+  // Remember the packet layouts the sensor will send. It sends exactly what was written, a VN-100 including
+  // the GPS and INS fields set by default. (Reading the registers back is no help: vnproglib parses their
+  // hex fields as decimal.) AsyncPacketReceivedHandler drops packets with any other layout.
+  std::vector<BinaryLayout> layouts;
+  auto addLayout = [&](const vn::sensors::BinaryOutputRegister & bo) {
+    if (bo.asyncMode == vn::protocol::uart::AsyncMode::ASYNCMODE_NONE) {
+      return;
+    }
+    const uint16_t fields[] = {
+      static_cast<uint16_t>(bo.commonField), static_cast<uint16_t>(bo.timeField),
+      static_cast<uint16_t>(bo.imuField), static_cast<uint16_t>(bo.gpsField),
+      static_cast<uint16_t>(bo.attitudeField), static_cast<uint16_t>(bo.insField),
+      static_cast<uint16_t>(bo.gps2Field)};
+    BinaryLayout layout{0, {}};
+    std::string text;
+    for (int group = 0; group < 7; group++) {
+      if (fields[group]) {
+        layout.groups |= 1 << group;
+        layout.fields.push_back(fields[group]);
+        char field[8];
+        snprintf(field, sizeof(field), " 0x%04X", fields[group]);
+        text += field;
+      }
+    }
+    for (const auto & known : layouts) {
+      if (known.groups == layout.groups && known.fields == layout.fields) {
+        return;
+      }
+    }
+    if (layout.groups) {
+      RCLCPP_INFO(get_logger(), "Binary output: groups 0x%02X, fields%s", layout.groups, text.c_str());
+      layouts.push_back(layout);
+    }
+  };
+  for (const auto & bo : boConfigs) {
+    addLayout(bo);
+  }
+  {
+    std::lock_guard<std::mutex> lock(binaryLayoutsMutex_);
+    binaryLayouts_ = layouts;
+  }
+
   // Verify that the device family is capable of supporting GPS
   if (vs_->determineDeviceFamily() != vn::sensors::VnSensor::VnSensor_Family_Vn100) {
     try {
@@ -756,6 +798,48 @@ rclcpp::Time Vectornav::getTimeStamp(vn::sensors::CompositeData & data)
   return (adjustedTime);
 }
 
+bool Vectornav::isConfiguredLayout(vn::protocol::uart::Packet & packet)
+{
+  const uint8_t groups = packet.groups();
+  {
+    std::lock_guard<std::mutex> lock(binaryLayoutsMutex_);
+    if (binaryLayouts_.empty()) {
+      return false;  // not configured yet: whatever arrives is from an older configuration
+    }
+    for (const auto & layout : binaryLayouts_) {
+      bool same = layout.groups == groups;
+      for (size_t i = 0; same && i < layout.fields.size(); i++) {
+        same = packet.groupField(i) == layout.fields[i];
+      }
+      if (same) {
+        consecutiveDropped_ = 0;
+        return true;
+      }
+    }
+  }
+  // Field words of groups 0-6 lie inside the packet; an undefined bit 7 adds a word the length ignores.
+  std::string text;
+  for (int i = 0, n = __builtin_popcount(groups & 0x7F); i < n; i++) {
+    char field[8];
+    snprintf(field, sizeof(field), " 0x%04X", packet.groupField(i));
+    text += field;
+  }
+  droppedPackets_++;
+  if (++consecutiveDropped_ >= 800) {
+    RCLCPP_ERROR_THROTTLE(
+      get_logger(), *get_clock(), 5000,
+      "No binary packet in the last %zu matched the configured output layouts: check the binary "
+      "output registers",
+      consecutiveDropped_);
+  }
+  RCLCPP_WARN_THROTTLE(
+    get_logger(), *get_clock(), 1000,
+    "Dropped a binary packet with a layout the sensor does not send (groups 0x%02X, fields%s): "
+    "data bytes that passed the CRC by chance. %zu dropped so far",
+    groups, text.c_str(), droppedPackets_);
+  return false;
+}
+
 void Vectornav::ErrorPacketReceivedHandler(
   void * nodeptr, vn::protocol::uart::Packet & errorPacket, size_t packetStartRunningIndex)
 {
@@ -776,6 +860,12 @@ void Vectornav::AsyncPacketReceivedHandler(
 
   // Verify that this packet is a binary output message
   if (asyncPacket.type() != vn::protocol::uart::Packet::TYPE_BINARY) {
+    return;
+  }
+
+  // A run of ordinary data bytes passes the packet finder's 16-bit CRC by chance about once in 65536
+  // tests. Such a "packet" has a layout the sensor was never told to send.
+  if (!node->isConfiguredLayout(asyncPacket)) {
     return;
   }
 
