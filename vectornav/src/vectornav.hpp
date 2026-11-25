@@ -156,6 +156,14 @@ namespace vectornav {
     double ppsEdgeDelay_{0.0};  ///< s: the edge's known delay after the whole second
     double ppsHoldover_{60.0};  ///< s: stamps carry on from the last pulse this long
     static constexpr int kPpsLockPulses = 3;
+    /// The loop that follows the pulse once locked: settles within ~3 s (error poles 0.7 +- 0.1i).
+    /// On Robin 12, with the sensor's late edges left out (kPpsLateNs), the stamps are within
+    /// 2 us of the pulse half the time and 35 us 95 % of the time, also while chrony slews.
+    static constexpr double kPpsPhaseGain = 0.5;
+    static constexpr double kPpsRateGain = 0.1;
+    static constexpr int64_t kPpsLateNs = 15000;  ///< an edge this much later than due is suspect
+    bool ppsLateSkipped_{false};                  ///< the last edge was left out as late
+    size_t ppsLateEdges_{0};
     bool ppsHaveCount_{false};
     uint32_t ppsLastCount_{0};    ///< SyncInCnt of the last edge seen
     uint64_t ppsLastStartup_{0};  ///< TimeStartup of the last packet: a restarted IMU goes back
@@ -167,8 +175,9 @@ namespace vectornav {
     uint64_t ppsRefEdge_{0};     ///< the edge stamps are counted from, IMU clock
     int64_t ppsRefNs_{0};        ///< and its system time (ns), following the pulse
     double ppsScale_{1.0};       ///< system-clock seconds per IMU-clock second
-    uint64_t ppsAnchorEdge_{0};  ///< first edge of the run the rate is measured over
+    uint64_t ppsAnchorEdge_{0};  ///< first edge of the pulses the rate is measured over to lock
     int64_t ppsAnchorSecond_{0};
+    double ppsLastOffset_{0.0};  ///< s: the last pulse's second minus where the stamps put it
     size_t ppsStrayEdges_{0};
     /// Binary packet layouts (groups byte + group fields) the sensor was configured to send
     struct BinaryLayout

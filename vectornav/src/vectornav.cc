@@ -805,6 +805,7 @@ void Vectornav::ppsReset()
   ppsHavePrev_ = false;
   ppsGoodInRow_ = 0;
   ppsLocked_ = false;
+  ppsLateSkipped_ = false;
   ppsScale_ = 1.0;
 }
 
@@ -822,9 +823,9 @@ void Vectornav::ppsReset()
  * of seconds after the previous accepted one on the sensor's clock; anything else is a stray edge
  * and is ignored. After kPpsLockPulses accepted edges in a row, a sample is stamped
  *     its second + (TimeStartup - edge) * scale,
- * scale being the system clock's seconds per sensor-clock second, measured over minutes of
- * pulses. Each later edge moves that reference a fifth of the way to its own second, so one late
- * pulse (it is made by software) moves the stamps by a fifth of its lateness. While
+ * scale being the system clock's seconds per sensor-clock second. At each later edge a loop
+ * (phase gain kPpsPhaseGain, rate gain kPpsRateGain) moves that reference and the scale towards
+ * the edge's second, so the stamps follow the system clock when chrony changes its rate. While
  * the pulse is missing the sensor's clock carries on from the last edge, up to pps_holdover_sec.
  * Returns nothing (the caller keeps `fallback`) until locked, or once the holdover runs out.
  */
@@ -861,15 +862,10 @@ std::optional<rclcpp::Time> Vectornav::ppsTimeStamp(
         const double tolerance = 2e-3 + 1e-4 * n;
         if (n >= 1 && std::abs(elapsed * ppsScale_ - n) <= tolerance) {
           ppsGoodInRow_++;
-          // The rate over the whole run of good pulses: the pulse's jitter (~0.1 ms) over one
-          // second would be 100 ppm, over minutes it is next to nothing.
+          // Until locked, the rate over the pulses so far; once locked, the loop below keeps it.
           const int64_t run = second - ppsAnchorSecond_;
-          if (run >= 1) {
+          if (!ppsLocked_ && run >= 1) {
             ppsScale_ = run / ((edge - ppsAnchorEdge_) * 1e-9);
-          }
-          if (run >= 300) {  // a new anchor now and then: the rate drifts with temperature
-            ppsAnchorEdge_ = edge;
-            ppsAnchorSecond_ = second;
           }
         } else if (n >= 1) {
           ppsGoodInRow_ = 1;  // whole seconds, but not on the sensor's clock: start again here
@@ -888,14 +884,30 @@ std::optional<rclcpp::Time> Vectornav::ppsTimeStamp(
         ppsPrevEdge_ = edge;
         ppsPrevSecond_ = second;
         if (ppsGoodInRow_ >= kPpsLockPulses) {
-          // Follow the pulse with a small gain: an edge that comes late (the pulse is made by
-          // software, ~0.1 ms now and then) moves the stamps a fifth of that.
+          // Follow the pulse with a loop that keeps both where the stamps are and their rate: the
+          // system clock's rate changes with chrony's corrections (up to 500 ppm after a boot),
+          // and is followed within seconds. The pulse is within a few us of the second, so the
+          // gains can be high.
           const int64_t onSecond = second * 1000000000LL;
           if (ppsLocked_) {
-            const int64_t predicted =
-              ppsRefNs_ + std::llround(static_cast<int64_t>(edge - ppsRefEdge_) * ppsScale_);
+            const double sinceRefEdge = static_cast<int64_t>(edge - ppsRefEdge_) * 1e-9;
+            const int64_t predicted = ppsRefNs_ + std::llround(sinceRefEdge * ppsScale_ * 1e9);
             const int64_t off = onSecond - predicted;
-            ppsRefNs_ = std::llabs(off) > 1000000 ? onSecond : predicted + off / 5;
+            ppsLastOffset_ = off * 1e-9;
+            if (std::llabs(off) > 5000000) {  // the clock was stepped: start from this edge
+              ppsRefNs_ = onSecond;
+              ppsLateSkipped_ = false;
+            } else if (off < -kPpsLateNs && !ppsLateSkipped_) {
+              // The sensor sees about one edge in four 20-100 us late (never early): one late
+              // edge is left out; a second in a row is the clock's rate changing, and is followed.
+              ppsRefNs_ = predicted;
+              ppsLateSkipped_ = true;
+              ppsLateEdges_++;
+            } else {
+              ppsLateSkipped_ = false;
+              ppsRefNs_ = predicted + std::llround(kPpsPhaseGain * off);
+              ppsScale_ += kPpsRateGain * off * 1e-9 / sinceRefEdge;
+            }
           } else {
             ppsRefNs_ = onSecond;
           }
@@ -910,9 +922,11 @@ std::optional<rclcpp::Time> Vectornav::ppsTimeStamp(
           }
           RCLCPP_INFO_THROTTLE(
             get_logger(), *get_clock(), 600000,
-            "SYNC_IN pulse: locked, sensor clock %+.1f ppm, edge %+.2f ms from the second by "
-            "arrival, %zu stray edges so far",
-            (ppsScale_ - 1.0) * 1e6, error * 1e3, ppsStrayEdges_);
+            "SYNC_IN pulse: locked, last pulse %+.1f us from the stamps, sensor clock %+.1f ppm "
+            "from the system clock, edge %+.2f ms from the second by arrival, %zu late edges left "
+            "out, %zu stray edges",
+            ppsLastOffset_ * 1e6, (ppsScale_ - 1.0) * 1e6, error * 1e3, ppsLateEdges_,
+            ppsStrayEdges_);
         }
       } else {
         ppsStrayEdges_++;
