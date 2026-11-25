@@ -13,6 +13,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -143,6 +144,32 @@ namespace vectornav {
     /// ROS header time stamp adjustments
     double averageTimeDifference_{0};
     bool adjustROSTimeStamp_{false};
+    rclcpp::Time adjustedTimeStamp(vn::sensors::CompositeData & data);
+
+    /// Time stamps from a 1 Hz pulse on SYNC_IN whose edge falls on every whole second of the
+    /// system clock (pps_timestamp). See ppsTimeStamp() in vectornav.cc.
+    std::optional<rclcpp::Time> ppsTimeStamp(
+      vn::sensors::CompositeData & data, const rclcpp::Time & fallback);
+    void ppsReset();
+    bool ppsEnabled_{false};
+    double ppsMaxError_{0.05};  ///< s: how far an edge may be from the whole second
+    double ppsEdgeDelay_{0.0};  ///< s: the edge's known delay after the whole second
+    double ppsHoldover_{60.0};  ///< s: stamps carry on from the last pulse this long
+    static constexpr int kPpsLockPulses = 3;
+    bool ppsHaveCount_{false};
+    uint32_t ppsLastCount_{0};    ///< SyncInCnt of the last edge seen
+    uint64_t ppsLastStartup_{0};  ///< TimeStartup of the last packet: a restarted IMU goes back
+    bool ppsHavePrev_{false};
+    uint64_t ppsPrevEdge_{0};   ///< last accepted edge, IMU clock (ns since startup)
+    int64_t ppsPrevSecond_{0};  ///< and the whole second it fell on
+    int ppsGoodInRow_{0};
+    bool ppsLocked_{false};
+    uint64_t ppsRefEdge_{0};     ///< the edge stamps are counted from, IMU clock
+    int64_t ppsRefNs_{0};        ///< and its system time (ns), following the pulse
+    double ppsScale_{1.0};       ///< system-clock seconds per IMU-clock second
+    uint64_t ppsAnchorEdge_{0};  ///< first edge of the run the rate is measured over
+    int64_t ppsAnchorSecond_{0};
+    size_t ppsStrayEdges_{0};
     /// Binary packet layouts (groups byte + group fields) the sensor was configured to send
     struct BinaryLayout
     {

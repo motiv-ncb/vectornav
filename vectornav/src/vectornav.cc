@@ -8,6 +8,7 @@
  */
 
 #include <chrono>
+#include <cmath>
 #include <functional>
 #include <memory>
 #include <queue>
@@ -56,6 +57,19 @@ Vectornav::Vectornav(const rclcpp::NodeOptions & options) : Node("vectornav", op
 
   // Flag to adjust ROS time stamps
   adjustROSTimeStamp_ = declare_parameter<bool>("adjust_ros_timestamp", false);
+
+  // Time stamps from a 1 Hz pulse on SYNC_IN that falls on every whole system-clock second.
+  // Needs TimeStartup, TimeSyncIn and SyncInCnt in the binary outputs (see ppsTimeStamp()).
+  ppsEnabled_ = declare_parameter<bool>("pps_timestamp", false);
+  ppsMaxError_ = declare_parameter<double>("pps_max_error_sec", 0.05);
+  ppsEdgeDelay_ = declare_parameter<double>("pps_edge_delay_sec", 0.0);
+  ppsHoldover_ = declare_parameter<double>("pps_holdover_sec", 60.0);
+  if (ppsEnabled_) {
+    RCLCPP_INFO(
+      get_logger(),
+      "Time stamps from the SYNC_IN pulse once %d pulses agree (within %.0f ms of the second)",
+      kPpsLockPulses, ppsMaxError_ * 1e3);
+  }
 
   // Async Output Type (ASCII)
   // 5.2.7
@@ -777,6 +791,159 @@ bool Vectornav::configure_sensor()
    */
 
 rclcpp::Time Vectornav::getTimeStamp(vn::sensors::CompositeData & data)
+{
+  const rclcpp::Time adjusted = adjustedTimeStamp(data);
+  if (!ppsEnabled_) {
+    return adjusted;
+  }
+  return ppsTimeStamp(data, adjusted).value_or(adjusted);
+}
+
+void Vectornav::ppsReset()
+{
+  ppsHaveCount_ = false;
+  ppsHavePrev_ = false;
+  ppsGoodInRow_ = 0;
+  ppsLocked_ = false;
+  ppsScale_ = 1.0;
+}
+
+/**
+ * The time stamp of a sample from the 1 Hz pulse on SYNC_IN.
+ *
+ * The pulse's counted edge falls on every whole second of the system clock (a network card's
+ * output, its clock kept to the system clock). The sensor gives, with each sample, TimeStartup
+ * (its own clock), TimeSyncIn (time since the last edge, same clock) and SyncInCnt (edges so far).
+ * So the edge is at TimeStartup - TimeSyncIn on the sensor's clock, and which whole second it
+ * fell on is the one nearest to its time by arrival (`fallback` - TimeSyncIn): arrival is off by
+ * the USB and serial delay, a few ms, far less than half a second.
+ *
+ * An edge is accepted when it is within pps_max_error_sec of the whole second and a whole number
+ * of seconds after the previous accepted one on the sensor's clock; anything else is a stray edge
+ * and is ignored. After kPpsLockPulses accepted edges in a row, a sample is stamped
+ *     its second + (TimeStartup - edge) * scale,
+ * scale being the system clock's seconds per sensor-clock second, measured over minutes of
+ * pulses. Each later edge moves that reference a fifth of the way to its own second, so one late
+ * pulse (it is made by software) moves the stamps by a fifth of its lateness. While
+ * the pulse is missing the sensor's clock carries on from the last edge, up to pps_holdover_sec.
+ * Returns nothing (the caller keeps `fallback`) until locked, or once the holdover runs out.
+ */
+std::optional<rclcpp::Time> Vectornav::ppsTimeStamp(
+  vn::sensors::CompositeData & data, const rclcpp::Time & fallback)
+{
+  if (!data.hasTimeStartup()) {
+    return std::nullopt;
+  }
+  const uint64_t startup = data.timeStartup();
+  if (startup < ppsLastStartup_) {  // the sensor restarted: its clock and counter begin again
+    if (ppsLocked_) {
+      RCLCPP_WARN(get_logger(), "SYNC_IN pulse: the sensor restarted, locking again");
+    }
+    ppsReset();
+  }
+  ppsLastStartup_ = startup;
+
+  if (data.hasTimeSyncIn() && data.hasSyncInCnt()) {
+    const uint32_t count = data.syncInCnt();
+    const uint64_t sinceEdge = data.timeSyncIn();
+    if ((!ppsHaveCount_ || count != ppsLastCount_) && sinceEdge <= startup) {
+      ppsHaveCount_ = true;
+      ppsLastCount_ = count;
+      const uint64_t edge = startup - sinceEdge;
+      const double byArrival = fallback.seconds() - sinceEdge * 1e-9;
+      const int64_t second = std::llround(byArrival);
+      const double error = byArrival - second;
+      bool accepted = std::abs(error) <= ppsMaxError_;
+      if (accepted && ppsHavePrev_) {
+        const int64_t n = second - ppsPrevSecond_;
+        const double elapsed = (edge - ppsPrevEdge_) * 1e-9;
+        // Pulse jitter (< 1 ms) plus the sensor clock's rate error (< 100 ppm).
+        const double tolerance = 2e-3 + 1e-4 * n;
+        if (n >= 1 && std::abs(elapsed * ppsScale_ - n) <= tolerance) {
+          ppsGoodInRow_++;
+          // The rate over the whole run of good pulses: the pulse's jitter (~0.1 ms) over one
+          // second would be 100 ppm, over minutes it is next to nothing.
+          const int64_t run = second - ppsAnchorSecond_;
+          if (run >= 1) {
+            ppsScale_ = run / ((edge - ppsAnchorEdge_) * 1e-9);
+          }
+          if (run >= 300) {  // a new anchor now and then: the rate drifts with temperature
+            ppsAnchorEdge_ = edge;
+            ppsAnchorSecond_ = second;
+          }
+        } else if (n >= 1) {
+          ppsGoodInRow_ = 1;  // whole seconds, but not on the sensor's clock: start again here
+          ppsAnchorEdge_ = edge;
+          ppsAnchorSecond_ = second;
+        } else {
+          accepted = false;  // a second edge within the same second
+        }
+      } else if (accepted) {
+        ppsGoodInRow_ = 1;
+        ppsAnchorEdge_ = edge;
+        ppsAnchorSecond_ = second;
+      }
+      if (accepted) {
+        ppsHavePrev_ = true;
+        ppsPrevEdge_ = edge;
+        ppsPrevSecond_ = second;
+        if (ppsGoodInRow_ >= kPpsLockPulses) {
+          // Follow the pulse with a small gain: an edge that comes late (the pulse is made by
+          // software, ~0.1 ms now and then) moves the stamps a fifth of that.
+          const int64_t onSecond = second * 1000000000LL;
+          if (ppsLocked_) {
+            const int64_t predicted =
+              ppsRefNs_ + std::llround(static_cast<int64_t>(edge - ppsRefEdge_) * ppsScale_);
+            const int64_t off = onSecond - predicted;
+            ppsRefNs_ = std::llabs(off) > 1000000 ? onSecond : predicted + off / 5;
+          } else {
+            ppsRefNs_ = onSecond;
+          }
+          ppsRefEdge_ = edge;
+          if (!ppsLocked_) {
+            ppsLocked_ = true;
+            RCLCPP_INFO(
+              get_logger(),
+              "SYNC_IN pulse locked: stamps from the pulse (edge %+.2f ms from the second by "
+              "arrival)",
+              error * 1e3);
+          }
+          RCLCPP_INFO_THROTTLE(
+            get_logger(), *get_clock(), 600000,
+            "SYNC_IN pulse: locked, sensor clock %+.1f ppm, edge %+.2f ms from the second by "
+            "arrival, %zu stray edges so far",
+            (ppsScale_ - 1.0) * 1e6, error * 1e3, ppsStrayEdges_);
+        }
+      } else {
+        ppsStrayEdges_++;
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 10000,
+          "SYNC_IN: ignored an edge %+.1f ms from the whole second (%zu so far): %s", error * 1e3,
+          ppsStrayEdges_,
+          std::abs(error) > ppsMaxError_ ? "is the pulse's card clock kept to the system clock?"
+                                         : "a stray edge");
+      }
+    }
+  }
+
+  if (!ppsLocked_) {
+    return std::nullopt;
+  }
+  const double sinceRef = (static_cast<int64_t>(startup - ppsRefEdge_)) * 1e-9 * ppsScale_;
+  if (sinceRef > ppsHoldover_) {
+    RCLCPP_WARN(
+      get_logger(), "SYNC_IN pulse lost for %.0f s: stamps by arrival until it is back",
+      ppsHoldover_);
+    ppsLocked_ = false;
+    ppsGoodInRow_ = 0;
+    ppsHavePrev_ = false;
+    return std::nullopt;
+  }
+  const int64_t stamp = ppsRefNs_ + std::llround((sinceRef + ppsEdgeDelay_) * 1e9);
+  return rclcpp::Time(stamp, RCL_SYSTEM_TIME);
+}
+
+rclcpp::Time Vectornav::adjustedTimeStamp(vn::sensors::CompositeData & data)
 {
   const rclcpp::Time t = now();
   if (!data.hasTimeStartup() || !adjustROSTimeStamp_) {
